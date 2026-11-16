@@ -5,14 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
-  test-and-deploy:
+  test:
+    name: Test backend and frontend
     runs-on: ubuntu-latest
-
-    env:
-      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-      GCP_REGION: ${{ secrets.GCP_REGION }}
 
     steps:
       - name: Checkout code
@@ -22,14 +20,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "18"
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
 
       - name: Install backend dependencies
         working-directory: backend
-        run: npm install
+        run: npm ci
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: npm install
+        run: npm ci
 
       - name: Run backend tests
         working-directory: backend
@@ -39,54 +41,82 @@ jobs:
         working-directory: frontend
         run: npm test
 
+  deploy:
+    name: Deploy to Google Cloud Run
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    env:
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ secrets.GCP_REGION }}
+      ARTIFACT_REPOSITORY: recipe-app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          test -n "$GCP_PROJECT_ID" || (echo "Missing GCP_PROJECT_ID secret" && exit 1)
+          test -n "$GCP_REGION" || (echo "Missing GCP_REGION secret" && exit 1)
+          test -n "$GCP_SA_KEY" || (echo "Missing GCP_SA_KEY secret" && exit 1)
+
       - name: Authenticate to Google Cloud
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Set up Google Cloud CLI
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.GCP_PROJECT_ID }}
 
-      - name: Configure Docker for Google Cloud
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
-        run: gcloud auth configure-docker gcr.io --quiet
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
 
       - name: Build and push backend image
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
         run: |
-          docker build -t gcr.io/${GCP_PROJECT_ID}/recipe-backend:${GITHUB_SHA} ./backend
-          docker push gcr.io/${GCP_PROJECT_ID}/recipe-backend:${GITHUB_SHA}
-
-      - name: Build and push frontend image
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
-        run: |
-          docker build -t gcr.io/${GCP_PROJECT_ID}/recipe-frontend:${GITHUB_SHA} ./frontend
-          docker push gcr.io/${GCP_PROJECT_ID}/recipe-frontend:${GITHUB_SHA}
+          BACKEND_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/recipe-backend:${GITHUB_SHA}"
+          docker build -t "$BACKEND_IMAGE" ./backend
+          docker push "$BACKEND_IMAGE"
+          echo "BACKEND_IMAGE=$BACKEND_IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy backend to Cloud Run
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
         run: |
           gcloud run deploy recipe-backend \
-            --image gcr.io/${GCP_PROJECT_ID}/recipe-backend:${GITHUB_SHA} \
-            --region ${GCP_REGION} \
+            --image "$BACKEND_IMAGE" \
+            --region "$GCP_REGION" \
             --platform managed \
-            --allow-unauthenticated
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Read backend URL
+        run: |
+          BACKEND_URL="$(gcloud run services describe recipe-backend --region="$GCP_REGION" --format='value(status.url)')"
+          echo "BACKEND_URL=$BACKEND_URL" >> "$GITHUB_ENV"
+          echo "Backend URL: $BACKEND_URL"
+
+      - name: Build and push frontend image
+        run: |
+          FRONTEND_IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${ARTIFACT_REPOSITORY}/recipe-frontend:${GITHUB_SHA}"
+          docker build --build-arg VITE_API_URL="$BACKEND_URL" -t "$FRONTEND_IMAGE" ./frontend
+          docker push "$FRONTEND_IMAGE"
+          echo "FRONTEND_IMAGE=$FRONTEND_IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy frontend to Cloud Run
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
         run: |
           gcloud run deploy recipe-frontend \
-            --image gcr.io/${GCP_PROJECT_ID}/recipe-frontend:${GITHUB_SHA} \
-            --region ${GCP_REGION} \
+            --image "$FRONTEND_IMAGE" \
+            --region "$GCP_REGION" \
             --platform managed \
-            --allow-unauthenticated
+            --allow-unauthenticated \
+            --quiet
 
-      - name: Get deployed URLs
-        if: ${{ env.GCP_PROJECT_ID != '' && env.GCP_REGION != '' }}
+      - name: Show deployed URLs
         run: |
-          echo "Backend URL: $(gcloud run services describe recipe-backend --region=${GCP_REGION} --format='value(status.url)')"
-          echo "Frontend URL: $(gcloud run services describe recipe-frontend --region=${GCP_REGION} --format='value(status.url)')"
+          FRONTEND_URL="$(gcloud run services describe recipe-frontend --region="$GCP_REGION" --format='value(status.url)')"
+          echo "Backend URL: $BACKEND_URL"
+          echo "Frontend URL: $FRONTEND_URL"

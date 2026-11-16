@@ -50,6 +50,21 @@ Frontend will run on `http://localhost:3000` (or the next available port).
 - `DELETE /api/recipes/:id` - Delete recipe
 - `GET /api/health` - Health check
 
+## CI/CD Pipeline
+
+GitHub Actions runs the backend and frontend test suites for every push and pull request to `main`.
+Deployment is a separate job that depends on the test job, so failed tests prevent deployment.
+Successful pushes to `main` build both Docker images, store them in Google Artifact Registry,
+and deploy the backend and frontend to Google Cloud Run.
+
+The workflow requires these GitHub Actions repository secrets:
+
+- `GCP_PROJECT_ID`
+- `GCP_REGION`
+- `GCP_SA_KEY`
+
+The Google Cloud project also needs an Artifact Registry Docker repository named `recipe-app`.
+
 ## Project Structure
 ```bash
 recipe-app/
